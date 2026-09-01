@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# captured artifacts
+snapshots/
+
+# databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# build output
+dist/
+
+# logs / editor / OS
+*.log
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/
