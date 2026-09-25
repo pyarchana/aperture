@@ -10,6 +10,17 @@ import Database from "better-sqlite3";
 export type MonitorType = "web" | "app" | "desktop";
 export type Severity = "low" | "medium" | "high" | "critical";
 
+/** The only classifications the analyzer may produce. */
+export const CHANGE_TYPES = [
+  "pricing_change",
+  "new_feature",
+  "ui_redesign",
+  "content_update",
+  "no_change",
+] as const;
+
+export type ChangeType = (typeof CHANGE_TYPES)[number];
+
 export interface Competitor {
   id: number;
   name: string;
@@ -33,7 +44,7 @@ export interface Change {
   snapshot_id: number;
   /** Null for the first change on a competitor, which has nothing to compare to. */
   previous_snapshot_id: number | null;
-  change_type: string;
+  change_type: ChangeType;
   description: string;
   /** 0.0 - 1.0. */
   confidence: number;
@@ -52,6 +63,21 @@ export interface Alert {
   read_status: number;
   created_at: string;
 }
+
+/** Shared by the table definition and the migration, so they cannot drift. */
+const CHANGE_TYPE_CHECK = `CHECK (change_type IN (${CHANGE_TYPES.map((t) => `'${t}'`).join(", ")}))`;
+
+const CHANGES_COLUMNS = `
+  id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_id             INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+  previous_snapshot_id    INTEGER REFERENCES snapshots(id) ON DELETE SET NULL,
+  change_type             TEXT    NOT NULL ${CHANGE_TYPE_CHECK},
+  description             TEXT    NOT NULL,
+  confidence              REAL    NOT NULL DEFAULT 0 CHECK (confidence BETWEEN 0 AND 1),
+  verified                INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0, 1)),
+  desktop_screenshot_path TEXT,
+  created_at              TEXT    NOT NULL DEFAULT (datetime('now'))
+`;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS competitors (
@@ -72,17 +98,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
   captured_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS changes (
-  id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-  snapshot_id             INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
-  previous_snapshot_id    INTEGER REFERENCES snapshots(id) ON DELETE SET NULL,
-  change_type             TEXT    NOT NULL,
-  description             TEXT    NOT NULL,
-  confidence              REAL    NOT NULL DEFAULT 0 CHECK (confidence BETWEEN 0 AND 1),
-  verified                INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0, 1)),
-  desktop_screenshot_path TEXT,
-  created_at              TEXT    NOT NULL DEFAULT (datetime('now'))
-);
+CREATE TABLE IF NOT EXISTS changes (${CHANGES_COLUMNS});
 
 CREATE TABLE IF NOT EXISTS alerts (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,6 +125,60 @@ export class ApertureDatabase {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA);
+    this.migrateChangeTypeCheck();
+  }
+
+  /**
+   * Retrofits the change_type CHECK onto databases created before it existed.
+   *
+   * `CREATE TABLE IF NOT EXISTS` silently skips an existing table, so without
+   * this a database created earlier would never gain the constraint. SQLite
+   * cannot add one in place, so the table is rebuilt using the documented
+   * procedure. Foreign keys are off for the swap because alerts.change_id
+   * references this table, then re-enabled and verified.
+   */
+  private migrateChangeTypeCheck(): void {
+    const table = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'changes'")
+      .get() as { sql: string } | undefined;
+
+    if (!table || table.sql.includes("CHECK (change_type")) return;
+
+    this.db.pragma("foreign_keys = OFF");
+    try {
+      this.db.exec(`
+        BEGIN;
+        CREATE TABLE changes_migrated (${CHANGES_COLUMNS});
+        INSERT INTO changes_migrated
+          SELECT id, snapshot_id, previous_snapshot_id, change_type, description,
+                 confidence, verified, desktop_screenshot_path, created_at
+            FROM changes;
+        DROP TABLE changes;
+        ALTER TABLE changes_migrated RENAME TO changes;
+        COMMIT;
+      `);
+    } catch (error) {
+      if (this.db.inTransaction) this.db.exec("ROLLBACK");
+      throw new Error(
+        "Could not add the change_type constraint - a row in 'changes' holds a " +
+          `value outside [${CHANGE_TYPES.join(", ")}]. ` +
+          (error instanceof Error ? error.message : String(error)),
+        { cause: error },
+      );
+    } finally {
+      this.db.pragma("foreign_keys = ON");
+    }
+
+    const orphans = this.db.pragma("foreign_key_check") as unknown[];
+    if (orphans.length > 0) {
+      throw new Error(
+        `change_type migration left ${orphans.length} orphaned alert row(s).`,
+      );
+    }
+
+    // DROP TABLE took the table's indexes with it; SCHEMA recreates them.
+    this.db.exec(SCHEMA);
+    console.log("[db] migrated: added change_type constraint to 'changes'.");
   }
 
   /** Underlying handle, for migrations or ad-hoc queries. */
@@ -207,7 +277,7 @@ export class ApertureDatabase {
   addChange(input: {
     snapshot_id: number;
     previous_snapshot_id?: number | null;
-    change_type: string;
+    change_type: ChangeType;
     description: string;
     confidence?: number;
     verified?: boolean;
