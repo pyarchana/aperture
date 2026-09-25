@@ -4,177 +4,147 @@ import path from "node:path";
 
 import { Solari } from "@solarisdk/browser";
 
-/**
- * Result of capturing one target surface.
- *
- * Declared here (rather than in a separate types module) because the browser
- * is the primary capture surface; `sandbox.ts` and `desktop.ts` import it.
- */
-export interface CaptureResult {
-  /** Normalized, diffable text. This is what change detection compares. */
-  text: string;
-  /** sha256 of `text`. */
-  hash: string;
+export interface ScrapeResult {
+  /** Path of the saved screenshot, relative to cwd, with forward slashes. */
+  screenshotPath: string;
+  /** sha256 of the page HTML. */
+  htmlHash: string;
+  /** Visible text from document.body. */
+  textContent: string;
   /**
-   * The raw capture (html, stdout, png bytes). Deliberately NOT written to
-   * disk here: most captures find no change and are discarded, and writing
-   * eagerly would leave an orphaned file behind on every unchanged run. The
-   * scheduler persists this only when it actually records a snapshot.
+   * Presigned replay URL for the session recording. Null when the replay was
+   * not ready in time - the gateway needs a moment after release to publish
+   * it, and a missing recording is not worth failing an otherwise good scrape.
    */
-  raw: string | Uint8Array;
-  /** File extension for `raw`, used when it is persisted. */
-  extension: string;
-  /** Which capture path produced this result. */
-  source: "solari-browser" | "fetch-fallback" | "solari-sandbox" | "solari-desktop";
+  sessionRecordingUrl: string | null;
 }
-
-/** Thrown when SOLARI_API_KEY is missing, so callers can decide how to degrade. */
-export class SolariNotConfiguredError extends Error {
-  constructor() {
-    super("SOLARI_API_KEY is not set.");
-    this.name = "SolariNotConfiguredError";
-  }
-}
-
-export function solariApiKey(): string {
-  const apiKey = process.env.SOLARI_API_KEY;
-  if (!apiKey) throw new SolariNotConfiguredError();
-  return apiKey;
-}
-
-/** Gateway base URL, required by the sandbox and desktop clients. */
-export function solariBaseUrl(): string {
-  return process.env.SOLARI_BASE_URL ?? "https://api.getsolari.com";
-}
-
-export function sha256(input: string): string {
-  return crypto.createHash("sha256").update(input, "utf8").digest("hex");
-}
-
-export function snapshotDir(): string {
-  return path.resolve(process.env.SNAPSHOT_DIR ?? "./snapshots");
-}
-
-/** Writes a raw artifact under SNAPSHOT_DIR and returns its relative path. */
-export async function writeArtifact(
-  targetId: number,
-  extension: string,
-  data: string | Uint8Array,
-): Promise<string> {
-  const relDir = path.join(String(targetId));
-  const absDir = path.join(snapshotDir(), relDir);
-  await fs.mkdir(absDir, { recursive: true });
-
-  const name = `${new Date().toISOString().replace(/[:.]/g, "-")}.${extension}`;
-  await fs.writeFile(path.join(absDir, name), data);
-  // Stored with forward slashes so the path stays portable across platforms.
-  return path.posix.join(relDir, name);
-}
-
-/**
- * Collapses HTML into diff-friendly text: scripts and styles dropped, tags
- * stripped, entities decoded, whitespace normalized. Keeps diffs about
- * content rather than markup churn.
- */
-export function htmlToText(html: string): string {
-  return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ")
-    .replace(/<\/(p|div|section|article|li|tr|h[1-6])>/gi, "\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n\s*\n\s*/g, "\n")
-    .trim();
-}
-
-/* ---------------------------------------------------------------------------
- * Solari adapter
- *
- * @solarisdk/browser hands back a Playwright-compatible browser over a remote
- * session, so navigation and content extraction are ordinary Playwright calls.
- * ------------------------------------------------------------------------ */
 
 const NAV_TIMEOUT_MS = 45_000;
+const SNAPSHOT_ROOT = "snapshots";
+/** getReplayUrl becomes available ~1-3s after the session is released. */
+const REPLAY_ATTEMPTS = 5;
+const REPLAY_RETRY_MS = 1_000;
 
-let solari: Solari | null = null;
-
-function getSolari(): Solari {
-  if (solari) return solari;
-  solari = new Solari({ apiKey: solariApiKey() });
-  return solari;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Releases the shared Solari client. Called on shutdown. */
-export async function closeSolari(): Promise<void> {
-  await solari?.close();
-  solari = null;
-}
+export class BrowserAgent {
+  private readonly apiKey: string;
 
-/**
- * Renders `url` in a Solari browser session and returns its final HTML.
- *
- * `stealth` is on because competitor marketing sites routinely bot-block
- * datacenter IPs; without it captures come back as challenge pages.
- */
-async function renderWithSolari(url: string): Promise<string> {
-  const browser = await getSolari().launch({ stealth: true });
-  try {
-    const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "networkidle", timeout: NAV_TIMEOUT_MS });
-    return await page.content();
-  } finally {
-    // Closes the browser and releases the remote session.
-    await browser.close();
+  constructor(options: { apiKey: string }) {
+    if (!options.apiKey) throw new Error("BrowserAgent requires an apiKey.");
+    this.apiKey = options.apiKey;
   }
-}
 
-/** Last-resort capture so the pipeline is runnable without a Solari key. */
-async function fetchFallback(url: string): Promise<string> {
-  const response = await fetch(url, {
-    headers: { "user-agent": "aperture/0.1 (competitive monitoring)" },
-    redirect: "follow",
-  });
-  if (!response.ok) {
-    throw new Error(`GET ${url} failed: ${response.status} ${response.statusText}`);
+  /**
+   * Captures one page: screenshot, visible text, and a hash of the HTML.
+   *
+   * A Solari client is created and closed per scrape. The client owns a local
+   * proxy that keeps the event loop alive, so `solari.close()` in the finally
+   * block is what stops the process from hanging on exit - it runs on the
+   * error path too.
+   */
+  async scrape(url: string, competitorId: number): Promise<ScrapeResult> {
+    const solari = new Solari({ apiKey: this.apiKey });
+    let browser: Awaited<ReturnType<Solari["launch"]>> | undefined;
+
+    try {
+      // captcha and proxy both require stealth, per the SDK's option docs.
+      browser = await solari.launch({
+        stealth: true,
+        proxy: "us",
+        captcha: true,
+        recording: true,
+      });
+
+      // Captured before close(), which is what makes the replay retrievable.
+      const sessionId = browser.id;
+
+      const page = await browser.newPage();
+      await page.goto(url, {
+        waitUntil: "networkidle",
+        timeout: NAV_TIMEOUT_MS,
+      });
+
+      const html = await page.content();
+      const textContent = await page.innerText("body");
+      const png = await page.screenshot({ fullPage: true, type: "png" });
+
+      const screenshotPath = await this.saveScreenshot(competitorId, png);
+
+      // Release first: the replay is only published once the session ends.
+      await browser.close();
+      browser = undefined;
+
+      const sessionRecordingUrl = await this.fetchRecordingUrl(solari, sessionId);
+
+      return {
+        screenshotPath,
+        htmlHash: crypto.createHash("sha256").update(html, "utf8").digest("hex"),
+        textContent,
+        sessionRecordingUrl,
+      };
+    } catch (error) {
+      throw new Error(
+        `Scrape of ${url} failed: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    } finally {
+      // close() is idempotent, so the success path having already closed the
+      // browser is fine. Failures here must not mask the original error.
+      if (browser) {
+        await browser.close().catch(() => undefined);
+      }
+      await solari.close().catch(() => undefined);
+    }
   }
-  return response.text();
-}
 
-/**
- * Captures a web target.
- *
- * Prefers the Solari browser, which executes JavaScript - most competitor
- * pricing and marketing pages are client-rendered, and a raw fetch of those
- * returns an empty shell that diffs as "no change" forever. Falls back to
- * fetch only when no Solari key is configured.
- *
- * Both paths run the same htmlToText normalization, so switching between them
- * does not manufacture a spurious full-page diff.
- */
-export async function captureWeb(url: string): Promise<CaptureResult> {
-  let html: string;
-  let source: CaptureResult["source"] = "solari-browser";
+  /** Writes the PNG to ./snapshots/{competitorId}/{timestamp}.png. */
+  private async saveScreenshot(
+    competitorId: number,
+    png: Buffer,
+  ): Promise<string> {
+    const dir = path.join(SNAPSHOT_ROOT, String(competitorId));
+    await fs.mkdir(dir, { recursive: true });
 
-  try {
-    html = await renderWithSolari(url);
-  } catch (error) {
-    if (!(error instanceof SolariNotConfiguredError)) throw error;
+    // ':' and '.' are illegal in Windows filenames, so flatten the timestamp.
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const file = path.join(dir, `${stamp}.png`);
+    await fs.writeFile(file, png);
+
+    // Forward slashes so the stored path is portable across platforms.
+    return file.split(path.sep).join("/");
+  }
+
+  /**
+   * Polls for the session replay URL. Returns null rather than throwing - the
+   * screenshot and text are the payload, and losing the recording should not
+   * discard them.
+   */
+  private async fetchRecordingUrl(
+    solari: Solari,
+    sessionId: string,
+  ): Promise<string | null> {
+    // close() already released the session; this just confirms it landed.
+    await solari.sessions.releaseAndWait(sessionId).catch(() => undefined);
+
+    for (let attempt = 0; attempt < REPLAY_ATTEMPTS; attempt++) {
+      try {
+        const replay = await solari.sessions.getReplayUrl(sessionId);
+        if (replay.url) return replay.url;
+      } catch {
+        // Not published yet - fall through and retry.
+      }
+      await sleep(REPLAY_RETRY_MS);
+    }
+
     console.warn(
-      "[solari/browser] SOLARI_API_KEY is not set - falling back to fetch(). " +
-        "Client-rendered pages will capture as empty shells.",
+      `[solari/browser] replay URL for session ${sessionId} was not ready after ` +
+        `${(REPLAY_ATTEMPTS * REPLAY_RETRY_MS) / 1000}s.`,
     );
-    html = await fetchFallback(url);
-    source = "fetch-fallback";
+    return null;
   }
-
-  const text = htmlToText(html);
-  return { text, hash: sha256(text), raw: html, extension: "html", source };
 }
+
+export default BrowserAgent;
